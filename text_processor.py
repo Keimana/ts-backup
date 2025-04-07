@@ -1,40 +1,170 @@
-from nltk.tokenize import word_tokenize, sent_tokenize
-from nltk import FreqDist
+import re
+from collections import Counter
+from rouge import Rouge
+from transformers import BertTokenizer, BertModel  # Import the tokenizer and model
+from bert_score import score  # Import the BERTScore function
+import torch
 
 class TextProcessor:
     def __init__(self):
         self.fileContent = ''
         self.memo = {}  # Memoization table to store sentence scores
+        self.table = []  # Table for Bottom-Up approach
+        self.title = ''  # Title attribute
+        self.character_list = []  # List to store characters found
+        self.original_text = ''  # Initialize original_text
+        self.generated_summary = ''  # Initialize generated_summary
+        self.rouge = Rouge()  # Initialize Rouge instance for ROUGE score calculation
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')  # Use the BERT tokenizer
+        self.model = BertModel.from_pretrained('bert-base-uncased')  # Use the BERT model
 
-    def set_content(self, content):
+    def set_content(self, content, title=''):
+        """Sets the content of the text processor and optionally a title."""
         self.fileContent = content
+        self.memo = {}  # Reset memoization table
+        self.table = []  # Reset table for Bottom-Up approach
+        self.title = title  # Set the title
+        self.character_list = self.extract_characters()  # Extract characters and update the list
+        self.set_original_text(content)  # Set original text for ROUGE calculation
+
+    def get_content(self):
+        """Returns the current content of the text processor."""
+        return self.fileContent
+
+    def extract_characters(self):
+        """Extracts character names from the file content."""
+        characters = re.findall(r'\b[A-Z][a-z]*\b', self.fileContent)
+        return list(set(characters))  # Remove duplicates
+
+    def get_characters(self):
+        """Returns the list of extracted characters."""
+        return self.character_list
+
+    def tokenize_sentences(self, text):
+        """Splits text into sentences using regular expressions."""
+        sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\!|\?)\s', text)
+        return [sentence.strip() for sentence in sentences if sentence.strip()]
+
+    def tokenize_words(self, text):
+        """Splits text into words using regular expressions."""
+        return re.findall(r'\w+', text.lower())
+
+    def get_word_frequencies(self):
+        """Calculates word frequencies and normalizes them."""
+        words = self.tokenize_words(self.fileContent)
+        word_frequencies = Counter(words)
+        max_frequency = max(word_frequencies.values(), default=1)
+        return {word: freq / max_frequency for word, freq in word_frequencies.items()}
 
     def get_sentence_score(self, sentence, freq_dist):
-        # Check if the sentence's score is already computed and stored in memo
+        """Returns the score of a sentence based on word frequency, using memoization."""
         if sentence in self.memo:
-            return self.memo[sentence]
+            return self.memo[sentence]  # Return pre-computed score
         
-        # Calculate the score by summing up the frequency of each word in the sentence
-        score = sum(freq_dist.get(word.lower(), 0) for word in word_tokenize(sentence))
-        
-        # Store the computed score in the memo table
-        self.memo[sentence] = score
-        
+        words = self.tokenize_words(sentence)
+        score = sum(freq_dist.get(word, 0) for word in words)
+        self.memo[sentence] = score  # Store computed score
         return score
 
-    def generate_summary(self, num_sentences=3):
-        sentences = sent_tokenize(self.fileContent)
-        words = word_tokenize(self.fileContent)
-        freq_dist = FreqDist(word.lower() for word in words if word.isalpha())
-
-        # Score each sentence and store it in the memoization table
-        sentence_scores = {sentence: self.get_sentence_score(sentence, freq_dist) for sentence in sentences}
+    def generate_summary_top_down(self):
+        """Generates a summary using a Top-Down approach (memoization)."""
+        if not self.fileContent:
+            return "No content available to summarize."
         
-        # Select the top sentences based on their scores
-        summarized_sentences = sorted(sentences, key=lambda s: sentence_scores[s], reverse=True)[:num_sentences]
+        sentences = self.tokenize_sentences(self.fileContent)
+        freq_dist = self.get_word_frequencies()
 
-        return ' '.join(summarized_sentences)
+        # Score all sentences and sort them
+        sentence_scores = {sentence: self.get_sentence_score(sentence, freq_dist) for sentence in sentences}
+        summarized_sentences = sorted(sentence_scores, key=sentence_scores.get, reverse=True)
 
-    def display_memo(self):
-        # Return the memo table containing sentence scores
-        return self.memo
+        # Limit the summary to a specific number of sentences if needed (e.g., top 3)
+        top_n_sentences = 3
+        self.generated_summary = ' '.join(summarized_sentences[:top_n_sentences])  # Store the generated summary
+        return self.generated_summary
+
+    def generate_summary_bottom_up(self):
+        """Uses the Bottom-Up approach (tabulation) without summarizing the content."""
+        if not self.fileContent:
+            return "No content available to process."
+
+        # Tokenize the sentences in the content
+        sentences = self.tokenize_sentences(self.fileContent)
+
+        # Get the word frequencies from the content
+        freq_dist = self.get_word_frequencies()
+        
+        # Define a table for storing sentence scores (using bottom-up approach)
+        num_sentences = len(sentences)
+        self.table = [0] * num_sentences
+
+        # Fill the table with sentence scores
+        for i in range(num_sentences):
+            self.table[i] = self.get_sentence_score(sentences[i], freq_dist)
+
+        # Instead of summarizing, just return the table and sentences for reference
+        return {
+            "sentence_scores": list(zip(sentences, self.table)),  # Return sentences with their respective scores
+            "table": self.table  # Return the table of scores
+        }
+
+    def set_original_text(self, content):
+        """Sets the original text for ROUGE score calculation."""
+        self.original_text = content
+
+    def get_rouge_scores(self, decimal_places=3):
+        """Calculates and returns the ROUGE scores between the generated summary and the original text."""
+        if not self.original_text:
+            raise ValueError("Original text is empty. Please set the original text before calculating ROUGE scores.")
+
+        # Use the generated summary from Top-Down or process the bottom-up results
+        summary = self.generated_summary or ' '.join([sentence for sentence, _ in self.generate_summary_bottom_up().get("sentence_scores", [])])
+        scores = self.rouge.get_scores(summary, self.original_text)
+
+        # Round the scores to the specified number of decimal places
+        for score in scores:
+            for metric, values in score.items():
+                values['p'] = round(values['p'], decimal_places)  # Precision
+                values['r'] = round(values['r'], decimal_places)  # Recall
+                values['f'] = round(values['f'], decimal_places)  # F1 score
+
+        return scores
+
+    def calculate_bertscore(self, generated_summary, reference_summary):
+        P, R, F1 = score([generated_summary], [reference_summary], lang='en', verbose=True)
+        return {
+            'precision': P.mean().item(),
+            'recall': R.mean().item(),
+            'f1': F1.mean().item()
+        }
+    def get_reference_summary(self):
+        """Returns the original text as the reference summary."""
+        return self.original_text
+    
+    def semantic_correlation(self, sentence_a, sentence_b):
+        inputs_a = self.tokenizer(sentence_a, return_tensors='pt', truncation=True, padding=True, max_length=512)
+        inputs_b = self.tokenizer(sentence_b, return_tensors='pt', truncation=True, padding=True, max_length=512)
+
+        with torch.no_grad():
+            embedding_a = self.model(**inputs_a).last_hidden_state.mean(dim=1)
+            embedding_b = self.model(**inputs_b).last_hidden_state.mean(dim=1)
+
+        if embedding_a.shape != embedding_b.shape:
+            print("Error: Embedding shapes do not match!")
+            return 0.0
+
+        similarity = torch.nn.functional.cosine_similarity(embedding_a, embedding_b)
+        return similarity.item()
+
+    def compression_ratio(self, original_text, summary):
+        return len(summary) / len(original_text)
+
+    def calculate_reference_free_score(self, summary):
+        self.generated_summary = summary
+        if self.original_text and self.generated_summary:
+            sem_corr = self.semantic_correlation(self.original_text, self.generated_summary)
+            comp_ratio = self.compression_ratio(self.original_text, self.generated_summary)
+            alpha = 0.5
+            final_score = (sem_corr ** alpha) * (comp_ratio ** (1 - alpha))
+            return final_score
+        return None
